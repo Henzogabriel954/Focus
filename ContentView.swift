@@ -41,7 +41,7 @@ class SyncService {
     private init() {}
     
     func sync(code: String, localCycles: [PomodoroCycle], completion: @escaping ([PomodoroCycle]?) -> Void) {
-        let url = URL(string: "http://p2.hcraft.online:8001/sync.php")!
+        let url = URL(string: "http://p2.hcraft.online:8002/sync.php")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
