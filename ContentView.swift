@@ -10,11 +10,55 @@ struct PomodoroCycle: Codable, Identifiable, Hashable {
     let studyActual: Int
     let breakActual: Int
     
+    enum CodingKeys: String, CodingKey {
+        case id
+        case date = "date_record"
+        case studyActual = "study_actual"
+        case breakActual = "break_actual"
+        case updatedAt = "updated_at"
+    }
+    
+    enum LegacyCodingKeys: String, CodingKey {
+        case date
+        case studyActual
+        case breakActual
+    }
+    
     init(date: Date, studyActual: Int, breakActual: Int) {
         self.id = UUID().uuidString
         self.date = date
         self.studyActual = studyActual
         self.breakActual = breakActual
+    }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        
+        // Try new keys first (Server/New Local)
+        let newDate = try container.decodeIfPresent(Date.self, forKey: .date)
+        let newStudy = try container.decodeIfPresent(Int.self, forKey: .studyActual)
+        let newBreak = try container.decodeIfPresent(Int.self, forKey: .breakActual)
+        let updatedDate = try container.decodeIfPresent(Date.self, forKey: .updatedAt)
+        
+        // Try legacy keys (Old Local Data)
+        let legacyContainer = try? decoder.container(keyedBy: LegacyCodingKeys.self)
+        let oldDate = try legacyContainer?.decodeIfPresent(Date.self, forKey: .date)
+        let oldStudy = try legacyContainer?.decodeIfPresent(Int.self, forKey: .studyActual)
+        let oldBreak = try legacyContainer?.decodeIfPresent(Int.self, forKey: .breakActual)
+        
+        // Resolve final values (New > Old > Fallback)
+        date = newDate ?? oldDate ?? updatedDate ?? Date()
+        studyActual = newStudy ?? oldStudy ?? 0
+        breakActual = newBreak ?? oldBreak ?? 0
+    }
+    
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(date, forKey: .date)
+        try container.encode(studyActual, forKey: .studyActual)
+        try container.encode(breakActual, forKey: .breakActual)
     }
     
     // Helpers for View grouping
@@ -41,23 +85,29 @@ class SyncService {
     private init() {}
     
     func sync(code: String, localCycles: [PomodoroCycle], completion: @escaping ([PomodoroCycle]?) -> Void) {
-        let url = URL(string: "http://p2.hcraft.online:8002/sync.php")!
+        let url = URL(string: "https://p2.hcraft.online/sync.php")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
         struct SyncRequest: Encodable {
             let code: String
-            let cycles: [PomodoroCycle]
+            let history: [PomodoroCycle]
         }
         
-        let payload = SyncRequest(code: code, cycles: localCycles)
+        let payload = SyncRequest(code: code, history: localCycles)
         
         let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX") // Ensure 24h format, no AM/PM
+        encoder.dateEncodingStrategy = .formatted(dateFormatter)
         
         do {
             let jsonData = try encoder.encode(payload)
+            if let jsonString = String(data: jsonData, encoding: .utf8) {
+                print("Sending JSON: \(jsonString)")
+            }
             request.httpBody = jsonData
             
             URLSession.shared.dataTask(with: request) { data, response, error in
@@ -67,17 +117,70 @@ class SyncService {
                     return
                 }
                 
+                if let jsonString = String(data: data, encoding: .utf8) {
+                    print("Server Response: \(jsonString)")
+                }
+                
                 let decoder = JSONDecoder()
-                decoder.dateDecodingStrategy = .iso8601
+                
+                let isoFormatter = ISO8601DateFormatter()
+                isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                
+                let sqlFormatter = DateFormatter()
+                sqlFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+                sqlFormatter.locale = Locale(identifier: "en_US_POSIX")
+                sqlFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+                
+                decoder.dateDecodingStrategy = .custom { decoder in
+                    let container = try decoder.singleValueContainer()
+                    let dateString = try container.decode(String.self)
+                    
+                    if let date = isoFormatter.date(from: dateString) {
+                        return date
+                    }
+                    
+                    // Try basic ISO if fractional seconds failed
+                    let basicIsoFormatter = ISO8601DateFormatter()
+                    if let date = basicIsoFormatter.date(from: dateString) {
+                        return date
+                    }
+                    
+                    if let date = sqlFormatter.date(from: dateString) {
+                        return date
+                    }
+                    
+                    throw DecodingError.dataCorruptedError(in: container, debugDescription: "Cannot decode date string \(dateString)")
+                }
+                
+                // Helper struct for dictionary response
+                struct SyncResponse: Decodable {
+                    let history: [PomodoroCycle]
+                }
                 
                 do {
-                    let remoteCycles = try decoder.decode([PomodoroCycle].self, from: data)
+                    // Try to decode as a Dictionary first (since the error indicates it's a dictionary)
+                    let wrapper = try decoder.decode(SyncResponse.self, from: data)
                     DispatchQueue.main.async {
-                        completion(remoteCycles)
+                        completion(wrapper.history)
                     }
-                } catch {
-                    print("Decoding error: \(error)")
-                    DispatchQueue.main.async { completion(nil) }
+                } catch let dictionaryError {
+                    // If dictionary decoding fails, try array (legacy/fallback)
+                    do {
+                        let remoteCycles = try decoder.decode([PomodoroCycle].self, from: data)
+                        DispatchQueue.main.async {
+                            completion(remoteCycles)
+                        }
+                    } catch {
+                        // Both failed. Analyze the dictionary error as it's the most relevant given the "typeMismatch" original error.
+                        print("Sync decoding error (Dictionary): \(dictionaryError)")
+                        print("Sync decoding error (Array): \(error)")
+                        
+                        if let jsonString = String(data: data, encoding: .utf8) {
+                            print("Received JSON: \(jsonString)")
+                        }
+                        
+                        DispatchQueue.main.async { completion(nil) }
+                    }
                 }
             }.resume()
             
@@ -213,7 +316,7 @@ class PomodoroTimerState: ObservableObject {
     // MARK: - Grouping Logic for History
     
     struct DayGroup: Identifiable {
-        let id = UUID()
+        var id: String { date }
         let date: String
         let cycles: [PomodoroCycle]
         
@@ -298,6 +401,14 @@ class PomodoroTimerState: ObservableObject {
         showPhaseEndAlert = false
         stopTimer()
         
+        // Ensure data exists even if we skipped without playing
+        if currentCycleData == nil {
+             currentCycleData = CycleData(
+                studyTime: studyTimeMinutes * 60,
+                breakTime: breakTimeMinutes * 60
+            )
+        }
+        
         if !isStudyMode {
             saveCycle()
             currentCycleData = nil
@@ -329,19 +440,44 @@ class PomodoroTimerState: ObservableObject {
             breakActual: data.breakActual / 10
         )
         
+        print("Saving new cycle locally: \(newCycle)")
         cycles.insert(newCycle, at: 0)
         saveCycles()
     }
     
     func loadCycles() {
-        if let data = UserDefaults.standard.data(forKey: "pomodoro_history"),
-           let saved = try? JSONDecoder().decode([PomodoroCycle].self, from: data) {
-            self.cycles = saved
+        if let data = UserDefaults.standard.data(forKey: "pomodoro_history") {
+            let decoder = JSONDecoder()
+            
+            // Try standard/new format first
+            let dateFormatter = DateFormatter()
+            dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+            dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+            decoder.dateDecodingStrategy = .formatted(dateFormatter)
+            
+            if let saved = try? decoder.decode([PomodoroCycle].self, from: data) {
+                self.cycles = saved
+                return
+            }
+            
+            // Fallback: Try default strategy (for old cache compatibility)
+            let legacyDecoder = JSONDecoder()
+            if let saved = try? legacyDecoder.decode([PomodoroCycle].self, from: data) {
+                self.cycles = saved
+            }
         }
     }
     
     func saveCycles() {
-        if let data = try? JSONEncoder().encode(cycles) {
+        let encoder = JSONEncoder()
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        encoder.dateEncodingStrategy = .formatted(dateFormatter)
+        
+        if let data = try? encoder.encode(cycles) {
             UserDefaults.standard.set(data, forKey: "pomodoro_history")
         }
     }
@@ -510,8 +646,20 @@ struct SettingsPopover: View {
                         isSyncing = true
                         SyncService.shared.sync(code: syncCode, localCycles: state.cycles) { remoteCycles in
                             isSyncing = false
-                            if let newCycles = remoteCycles {
-                                state.cycles = newCycles
+                            if let remote = remoteCycles {
+                                print("Merge - Local count: \(state.cycles.count)")
+                                print("Merge - Remote count: \(remote.count)")
+                                
+                                // Merge logic: Combine local and remote, deduplicating by ID
+                                var mergedMap = Dictionary(uniqueKeysWithValues: state.cycles.map { ($0.id, $0) })
+                                for cycle in remote {
+                                    mergedMap[cycle.id] = cycle
+                                }
+                                
+                                let sortedCycles = mergedMap.values.sorted { $0.date > $1.date }
+                                print("Merge - Final count: \(sortedCycles.count)")
+                                
+                                state.cycles = sortedCycles
                                 state.saveCycles()
                             }
                         }
